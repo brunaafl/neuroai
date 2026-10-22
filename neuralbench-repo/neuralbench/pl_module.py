@@ -19,6 +19,7 @@ from neuraltrain.metrics.metrics import GroupedMetric
 from neuraltrain.optimizers import LightningOptimizer
 from neuraltrain.utils import StandardScaler
 
+from .callbacks import UnfreezeAtEpoch
 from .modules import DownstreamWrapperModel
 
 LOGGER = logging.getLogger(__name__)
@@ -176,7 +177,7 @@ class BrainModule(pl.LightningModule):
 
         metric_pred, metric_true = y_pred, y_true
         loss_pred, loss_true = y_pred, y_true
-        metric_subjects = batch.data["subject_id"]
+        metric_groups = batch.data.get("stream_id", batch.data["subject_id"])
         if y_pred.ndim == 3 and y_true.ndim == 3:
             # A dense prediction is time-major (B, T, C) -- braindecode's
             # convention -- while an extracted target is channel-major (B, C, T).
@@ -200,7 +201,7 @@ class BrainModule(pl.LightningModule):
             metric_pred = loss_pred = y_pred[valid]
             metric_true = loss_true = y_true[valid]
             # Metric rows are frames, not windows: (B, 1) -> (B, T).
-            metric_subjects = metric_subjects.reshape(-1, 1).expand_as(valid)[valid]
+            metric_groups = metric_groups.reshape(-1, 1).expand_as(valid)[valid]
             y_pred = y_pred.masked_fill(~valid.unsqueeze(-1), torch.nan)
             y_pred = y_pred.reshape(y_pred.shape[0], -1)
             y_true = y_true.reshape(y_true.shape[0], -1)
@@ -249,7 +250,7 @@ class BrainModule(pl.LightningModule):
             assert isinstance(metric, Metric)
             if metric_name.startswith(step_name) and metric_true.numel():
                 if isinstance(metric, GroupedMetric):
-                    metric.update(metric_pred, metric_true, metric_subjects)
+                    metric.update(metric_pred, metric_true, metric_groups)
                 else:
                     if isinstance(metric, MultilabelConfusionMatrix):
                         metric.update(metric_pred, metric_true.int())
@@ -274,6 +275,12 @@ class BrainModule(pl.LightningModule):
     def on_test_epoch_end(self) -> None:
         self._log_metrics("test")
 
+    def on_fit_start(self) -> None:
+        # trainer.validate leaves inference-tensor states; fit validates under no_grad
+        for metric in self.metrics.values():
+            assert isinstance(metric, Metric)
+            metric.reset()
+
     def training_step(self, batch: Batch, batch_idx: int):
         loss, _, _ = self._run_step(batch, step_name="train", batch_idx=batch_idx)
         return loss
@@ -288,6 +295,14 @@ class BrainModule(pl.LightningModule):
 
     # Schedulers that need the total training step count at build time.
     _SCHEDULER_STEP_KWARG: tp.ClassVar[dict[type, str]] = {}
+
+    def configure_callbacks(self) -> list[pl.Callback]:
+        if (
+            isinstance(self.model, DownstreamWrapperModel)
+            and self.model.unfreeze_at_epoch is not None
+        ):
+            return [UnfreezeAtEpoch(self.model)]
+        return []
 
     def configure_optimizers(self):  # type: ignore[override]
         # Get scheduler-specific kwargs

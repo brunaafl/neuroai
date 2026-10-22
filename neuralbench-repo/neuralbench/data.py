@@ -21,6 +21,7 @@ from .extractors import SleepOnsetTargetExtractor  # noqa: F401
 from .registry import _validate_inputs
 from .transforms import (  # noqa: F401
     AddDefaultEvents,
+    AddOnsetEvents,
     AddSleepOnsetTargets,
     CropSleepRecordings,
     CropTimelines,
@@ -50,8 +51,8 @@ class BaseSampler(ns.base.NamedModel):
     samplers are selected from YAML via the ``name`` discriminator, e.g.
     ``sampler: {name: ClassificationSampler}``.
 
-    Only the training DataLoader uses the configured sampler; the val and
-    test order is set by ``Data.val_shuffle`` and ``Data.test_shuffle``.
+    Only the training DataLoader uses the configured sampler; validation and
+    test order is set by the ``Data`` shuffle options.
     """
 
     def build(
@@ -146,13 +147,16 @@ class Data(ns.BaseModel):
     study: ns.Step
     neuro: ns.extractors.BaseExtractor
     target: ns.extractors.BaseExtractor
-    channel_positions: ns.extractors.ChannelPositions
+    channel_positions: ns.extractors.ChannelPositions | None = None
     # Segments
     trigger_event_type: str | list[str]
     start: float = -0.5
     duration: float | None = 3
     stride: float | None = None
     stride_drop_incomplete: bool = True
+    # Drop segments missing an event for one of the extractors, rather than
+    # extracting an invalid target for them.
+    drop_incomplete: bool = False
     # Targets are NaN wherever the label is invalid (emg/pose IK failures). 1.0 drops
     # any segment holding one, which ``BrainModule`` would otherwise mask frame by frame.
     min_finite_target_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -172,10 +176,13 @@ class Data(ns.BaseModel):
     persistent_workers: bool = True
     prefetch_factor: int | None = None
     seed: int | None = None
+    # Stream key fields, e.g. [subject, session]; GroupedMetric then groups by stream
+    stream_by: list[str] | None = None
     # Others
     summary_columns: list[str] = []
 
     _subject_id: ns.extractors.LabelEncoder | None = None
+    _stream_id: ns.extractors.LabelEncoder | None = None
 
     def model_post_init(self, __context):
         super().model_post_init(__context)
@@ -184,6 +191,12 @@ class Data(ns.BaseModel):
             event_field="subject",
             return_one_hot=False,
         )
+        if self.stream_by is not None:
+            self._stream_id = ns.extractors.LabelEncoder(
+                event_types=self.neuro.event_types,
+                event_field="stream",
+                return_one_hot=False,
+            )
 
     def prepare(self) -> dict[str, DataLoader]:
         """Load events, build extractors, segment data and return train/val/test DataLoaders.
@@ -213,17 +226,27 @@ class Data(ns.BaseModel):
             "target": self.target,
             "subject_id": self._subject_id,
         }
+        if self.stream_by is not None:
+            missing = set(self.stream_by) - set(events.columns)
+            if missing:
+                raise ValueError(
+                    f"`data.stream_by` fields {sorted(missing)} are not event columns; "
+                    f"available: {sorted(events.columns)}"
+                )
+            stream = events[self.stream_by].astype(str).agg("/".join, axis=1)
+            events = events.assign(stream=stream)
+            extractors["stream_id"] = self._stream_id
 
         if isinstance(self.neuro, ns.extractors.MneRaw):
             # Prepare the neuro extractor first because the channel positions depend on it
             self.neuro.prepare(events)
             channels = self.neuro._channels
             assert channels is not None
-            channel_positions = self.channel_positions.build(self.neuro)
             LOGGER.info(
                 f"Found {len(channels)} different channels: {list(channels.keys())}"
             )
-            extractors["channel_positions"] = channel_positions
+            if self.channel_positions is not None:
+                extractors["channel_positions"] = self.channel_positions.build(self.neuro)
 
         trigger_event_type = (
             [self.trigger_event_type]
@@ -236,6 +259,7 @@ class Data(ns.BaseModel):
             trigger_query=f"type in {trigger_event_type}",
             stride=self.stride,
             stride_drop_incomplete=self.stride_drop_incomplete,
+            drop_incomplete=self.drop_incomplete,
             extractors=extractors,  # type: ignore[arg-type]
         )
         dataset = segmenter.apply(events)
@@ -304,7 +328,7 @@ class Data(ns.BaseModel):
             split_dataset = dataset.select(dataset.triggers.split == split)
             LOGGER.info(f"# {split} segments: {len(split_dataset)} \n")
 
-            sampler = None
+            sampler: tp.Iterable[int] | None = None
             if split == "train" and self.sampler is not None:
                 sampler = self.sampler.build(split_dataset, generator=sampler_gen)
 

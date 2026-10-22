@@ -22,16 +22,41 @@ from neuralset.dataloader import Batch
 from .callbacks import (
     PlotRegressionScatter,
     RecordingLevelEval,
-    ResetPerTimeline,
+    ResetPerStream,
+    UnfreezeAtEpoch,
     WindowPredictionCollector,
 )
-from .modules import DownstreamWrapperModel
+from .modules import DownstreamWrapper, DownstreamWrapperModel
 from .pl_module import BrainModule
 
 matplotlib.use("Agg")
 
 
-def test_reset_per_timeline_in_lightning():
+class _Backbone(nn.Linear):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x)
+
+
+def test_unfreeze_at_epoch() -> None:
+    backbone = _Backbone(4, 8)
+    backbone.bias.requires_grad = False  # frozen by the model itself
+    wrapper = DownstreamWrapper(layers_to_unfreeze=[""], unfreeze_at_epoch=1).build(
+        backbone, {"x": torch.randn(2, 4)}, n_outputs=1
+    )
+    callback = UnfreezeAtEpoch(wrapper)
+    trainer = SimpleNamespace(max_epochs=2, current_epoch=0)
+    callback.setup(trainer, wrapper, stage="fit")  # type: ignore[arg-type]
+    assert backbone.weight.requires_grad, "DDP must see the backbone as trainable"
+    callback.on_fit_start(trainer, wrapper)  # type: ignore[arg-type]
+    callback.on_train_epoch_start(trainer, wrapper)  # type: ignore[arg-type]
+    assert not backbone.weight.requires_grad
+    trainer.current_epoch = 1
+    callback.on_train_epoch_start(trainer, wrapper)  # type: ignore[arg-type]
+    assert backbone.weight.requires_grad
+    assert not backbone.bias.requires_grad
+
+
+def test_reset_per_stream_in_lightning():
     class Model(nn.Module):
         total = torch.tensor(100.0)  # a missed reset must also fail
 
@@ -46,14 +71,15 @@ def test_reset_per_timeline_in_lightning():
     observed: list[float] = []
     batches = [
         Batch(
-            segments=[SimpleNamespace(timeline=t) for t in timelines],
+            segments=[SimpleNamespace(timeline=s) for s in streams],
             data={
-                "neuro": torch.full((len(timelines), 1, 4), 2.0**i),
-                "target": torch.zeros(len(timelines), 1),
-                "subject_id": torch.zeros(len(timelines), 1, dtype=torch.long),
+                "neuro": torch.full((len(streams), 1, 4), 2.0**i),
+                "target": torch.zeros(len(streams), 1),
+                "subject_id": torch.zeros(len(streams), 1, dtype=torch.long),
+                "stream_id": torch.tensor([[s] for s in streams]),
             },
         )
-        for i, timelines in enumerate([["a"], ["a"], ["a", "b"], ["b"], ["b"]])
+        for i, streams in enumerate([[0], [0], [0, 1], [1], [1]])
     ]
     backbone = Model()
     model = DownstreamWrapperModel(backbone, torch.Size([1]), None, 1, aggregation=None)
@@ -63,7 +89,7 @@ def test_reset_per_timeline_in_lightning():
         metrics={"mae": torchmetrics.MeanAbsoluteError()},
         lightning_optimizer_config=None,
     )
-    callback = ResetPerTimeline()
+    callback = ResetPerStream()
     trainer = pl.Trainer(
         accelerator="cpu",
         callbacks=[callback],
