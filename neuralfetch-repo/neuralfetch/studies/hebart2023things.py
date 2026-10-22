@@ -459,6 +459,8 @@ class Hebart2023ThingsBold(_Hebart2023Things):
         return pd.concat([pd.DataFrame([fmri]), ns_events_df], axis=0)
 
     def _load_raw(self, timeline: dict[str, tp.Any]) -> nibabel.Nifti1Image:
+        if not (self.path / self.DERIVATIVES_FOLDER).exists():
+            return self._get_bold_image(timeline)  # raw BOLD, no mask
         return nutils.get_masked_bold_image(
             self._get_bold_image(timeline), self._get_bold_mask(timeline)
         )
@@ -522,6 +524,16 @@ class Hebart2023ThingsBold(_Hebart2023Things):
         return nibabel.load(fp, mmap=True)
 
     def _get_bold_image(self, timeline: dict[str, tp.Any]):
+        if not (self.path / self.DERIVATIVES_FOLDER).exists():
+            # fMRIPrep outputs are not part of ds004192: fall back to raw BOLD
+            fp = nutils.get_bids_filepath(
+                root_path=self.path / self.BIDS_FOLDER,
+                filetype="bold_raw",
+                data_type="Fmri",
+                ses_suffix=self.SESSION_SUFFIX,
+                **timeline,
+            )
+            return nibabel.load(fp, mmap=True)
         fp = nutils.get_bids_filepath(
             root_path=self.path / self.DERIVATIVES_FOLDER,
             filetype="bold",
