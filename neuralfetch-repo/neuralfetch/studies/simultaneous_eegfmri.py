@@ -35,7 +35,13 @@ from neuralset.events import study
 logger = logging.getLogger(__name__)
 
 # BIDS filename key -> timeline key
-_ENTITIES = {"sub": "subject", "ses": "session", "task": "task", "run": "run"}
+_ENTITIES = {
+    "sub": "subject",
+    "ses": "session",
+    "task": "task",
+    "acq": "acquisition",
+    "run": "run",
+}
 
 
 @lru_cache(maxsize=4)
@@ -78,7 +84,7 @@ class _BidsEegFmri(study.Study):
     EVENTS_RELATIVE_TO_FMRI: tp.ClassVar[bool] = True # related to the eeg
     # EEG file formats, by order of preference
     EEG_EXTENSIONS: tp.ClassVar[tuple[str, ...]] = (".vhdr", ".edf", ".set")
-    # preprocessing of the EEG shared in eeg/ ("raw" or "authors")
+    # preprocessing of the EEG shared in eeg/ ("raw", "authors" or "own")
     RAW_EEG_PREPROC: tp.ClassVar[str] = "raw"
     # authors' preprocessed EEG, relative to the BIDS root ({sub_dir}: sub-X[/ses-Y])
     PREPROC_EEG: tp.ClassVar[str | None] = None
@@ -193,6 +199,15 @@ class _BidsEegFmri(study.Study):
         offset = self._preproc_offset(self._raw_markers(timeline), pre_markers, pre_fp)
         return [dict(type="Eeg", start=offset, filepath=str(pre_fp), preproc="authors")]
 
+    def _own_eeg_file(self, timeline: dict[str, tp.Any]) -> Path:
+        """Own preprocessed EEG: the raw EEG path mirrored under preprocessed/, as .fif
+        (e.g. preprocessed/sub-01/eeg/sub-01_task-x_eeg.fif). It must keep the raw
+        EEG start (time 0 on the timeline clock)."""
+        raw_fp = self._eeg_file(timeline)
+        assert raw_fp is not None
+        rel = raw_fp.relative_to(self._bids_root())
+        return self._bids_root() / "preprocessed" / rel.with_suffix(".fif")
+
     def _readable_eeg_file(self, fp: Path) -> Path:
         """Some BrainVision headers point to the original (non-BIDS) data
         file names: write a fixed copy of the header next to the study."""
@@ -235,6 +250,7 @@ class _BidsEegFmri(study.Study):
         if fp is None:
             return pd.DataFrame()
         events = nutils.read_bids_events(fp).rename(columns={"onset": "start"})
+        events = events.dropna(subset=["start"])  # empty lines (ds002336 task-fmriNF)
         events["duration"] = events.duration.fillna(0.0)
         if "trial_type" in events.columns:
             events["description"] = events.trial_type.astype(str)
@@ -272,6 +288,11 @@ class _BidsEegFmri(study.Study):
         eegs.extend(self._preproc_eeg_events(timeline))
         if not eegs:
             raise RuntimeError(f"No EEG data for {timeline} in {self.path}")
+
+        # own preprocessed EEG: same start as the raw EEG, under preprocessed/
+        own_fp = self._own_eeg_file(timeline)
+        if own_fp.exists():
+            eegs.append(dict(type="Eeg", start=0.0, filepath=str(own_fp), preproc="own"))
 
         fmri = dict(type="Fmri", start=fmri_start, filepath=str(bold_fp), frequency=1.0 / tr)
         stims = self._task_events(timeline)
@@ -326,7 +347,7 @@ class Pereira2020Disentangling(_BidsEegFmri):
     OPENNEURO_ID: tp.ClassVar[str] = "ds002158"
     # anat/fmap are not used (and sub-26's T1w returns HTTP 404 on OpenNeuro)
     DOWNLOAD_EXCLUDE: tp.ClassVar[tuple[str, ...]] = (
-        "derivatives/fmriprep",
+        "derivatives/",
         "sub-*/ses-*/anat",
         "sub-*/ses-*/fmap",
     )
@@ -397,7 +418,7 @@ class Pereira2020Disentangling(_BidsEegFmri):
         return mne.io.RawArray(data[:, :, epoch] * 1e-6, mne_info, verbose=False)  # µV -> V
 
 
-class Lioi2020Simultaneous(_BidsEegFmri):
+class Lioi2020SimultaneousXp2(_BidsEegFmri):
     """EEG-fMRI-NF XP2: simultaneous EEG-fMRI during motor-imagery neurofeedback.
 
     Experimental Design:
@@ -439,9 +460,57 @@ class Lioi2020Simultaneous(_BidsEegFmri):
         "sub-*/func",
         "sub-*/eeg/*.vhdr",
         "sub-*/eeg/*.vmrk",
-        "derivatives/sub-*/eeg_pp",
+        "sub-*/eeg/*.eeg",
+
+    )
+    DOWNLOAD_EXCLUDE: tp.ClassVar[tuple[str, ...]] = (
+        "derivatives/",
     )
     PREPROC_EEG: tp.ClassVar[str | None] = "derivatives/{sub_dir}/eeg_pp/d_{prefix}_eeg_pp.vhdr"
+
+
+class Lioi2020SimultaneousXp1(Lioi2020SimultaneousXp2):
+    """EEG-fMRI-NF XP1: same setup as XP2 (``Lioi2020SimultaneousXp2``), to be pooled with it.
+
+    Experimental Design:
+        - Simultaneous 64-channel EEG (BrainAmp MR, 5000 Hz) and 3T fMRI (TR = 2 s)
+        - 10 participants
+        - Paradigm: 20 s blocks of rest and right-hand motor execution (motorloc)
+          or motor imagery without feedback (MIpre, MIpost) or with EEG, fMRI
+          or EEG-fMRI neurofeedback (eegNF, fmriNF, eegfmriNF); EEG and fMRI
+          are recorded in all runs
+
+    Data Format:
+        - BIDS (OpenNeuro ds002336), same layout as ds002338; preprocessed EEG
+          files have no ``d_`` prefix
+        - sub-xp102 motorloc has no preprocessed EEG; the preprocessed EEG of
+          sub-xp101 eegfmriNF and sub-xp106 MIpost does not match the raw EEG
+          (markers disagree, no cross-correlation peak): raw EEG is loaded instead
+        - EEG usually has up to 6 volume triggers less than the BOLD (missing
+          at the end; the first trigger is the first volume)
+    """
+
+    url: tp.ClassVar[str] = "https://openneuro.org/datasets/ds002336"
+    description: tp.ClassVar[str] = (
+        "Simultaneous EEG-fMRI from 10 participants during motor imagery neurofeedback (XP1)."
+    )
+    OPENNEURO_ID: tp.ClassVar[str] = "ds002336"
+    DOWNLOAD_INCLUDE: tp.ClassVar[tuple[str, ...]] = (
+        *Lioi2020SimultaneousXp2.DOWNLOAD_INCLUDE,
+        "sub-*/eeg/*.eeg"
+    )
+    DOWNLOAD_EXCLUDE: tp.ClassVar[tuple[str, ...]] = (
+        *Lioi2020SimultaneousXp2.DOWNLOAD_EXCLUDE,
+    )
+    
+    PREPROC_EEG: tp.ClassVar[str | None] = "derivatives/{sub_dir}/eeg_pp/{prefix}_eeg_pp.vhdr"
+
+    def _preproc_eeg_events(self, timeline: dict[str, tp.Any]) -> list[dict[str, tp.Any]]:
+        try:
+            return super()._preproc_eeg_events(timeline)
+        except RuntimeError as e:  # preprocessed EEG cannot be placed on the raw clock
+            logger.warning("%s: preprocessed EEG not loaded (%s)", self.__class__.__name__, e)
+            return []
 
 
 class Daly2019Electroencephalography(_BidsEegFmri):
@@ -531,7 +600,7 @@ class Liwicki2025Synchronous(_BidsEegFmri):
     )
     OPENNEURO_ID: tp.ClassVar[str] = "ds006033"
     VOLUME_MARKER: tp.ClassVar[str] = "Scanner/Scan Start"
-    RAW_EEG_PREPROC: tp.ClassVar[str] = "authors"  # pulse artifact corrected
+    RAW_EEG_PREPROC: tp.ClassVar[str] = "raw"  # pulse artifact corrected
 
 
 class Telesford2023Open(_BidsEegFmri):
@@ -709,8 +778,7 @@ class Cha2025Sustained(_BidsEegFmri):
         "sub-*/func",
         "sub-*/beh",
         "sub-*/eeg/*ON_run-*_eeg.set",
-        "derivatives/sub-*/eeg/*ON_run-*_desc-anc0qrsrm_eeg.*",
-        "derivatives/sub-*/beh",
+        "sub-*/eeg/*ON_run-*_eeg.fdt"
     )
     VOLUME_MARKER: tp.ClassVar[str] = "T  1"
     EEG_EXTENSIONS: tp.ClassVar[tuple[str, ...]] = (".set",)
@@ -792,7 +860,6 @@ class Kucyi2026Multisession(_BidsEegFmri):
     OPENNEURO_ID: tp.ClassVar[str] = "ds007216"
     # raw EEG data, intermediate preprocessing steps, anat/fmap and macOS "._" files
     DOWNLOAD_EXCLUDE: tp.ClassVar[tuple[str, ...]] = (
-        "*_eeg.eeg",
         "*_eeg_events.*",
         "*_Bergen.set",
         "*_Bergen.fdt",
@@ -840,3 +907,454 @@ class Kucyi2026Multisession(_BidsEegFmri):
             pre_markers = mne.read_annotations(pre_fp)
         offset = self._preproc_offset(self._raw_markers(timeline), pre_markers, pre_fp)
         return [dict(type="Eeg", start=offset, filepath=str(pre_fp), preproc="authors")]
+
+
+class Pisauro2017Neural(_BidsEegFmri):
+    """Value-based decisions EEG-fMRI: simultaneous EEG-fMRI during food choices.
+
+    Experimental Design:
+        - Simultaneous 64-channel EEG (5000 Hz, shared at 1000 Hz) and 3T fMRI (TR = 2.5 s)
+        - 22 participants, 2 runs each
+        - Paradigm: choice between two food items (left/right) rated beforehand
+
+    Data Format:
+        - OpenNeuro ds002734 (BIDS fMRI; EEG not in BIDS): only the authors'
+          preprocessed EEG is shared, as MATLAB files
+          (``sub-*/EEG/EEG_data_subXX_run_YY.mat``, ``Y`` = 64 x time in µV,
+          gradient + BCG artifacts removed, 0.5-40 Hz); no channel names, no
+          markers
+        - Alignment from ``sub-*/EEG/EEG_events_subXX.mat``: event times are in
+          ms on the EEG clock and the first volume of the shared BOLD is at
+          ``t0`` + 25 s (checked against ``func/*_events.tsv`` stimulus onsets)
+        - Events: Eeg, Fmri, Stimulus (``description`` = ``stim`` with ``rt``,
+          ``choose_left``, ``correct``, ``rating_left``/``rating_right``,
+          ``difficulty``; ``resp`` at the response). The ``resp`` rows of
+          ``func/*_events.tsv`` have the stimulus onset, so events come from
+          the EEG files
+    """
+
+    bibtex: tp.ClassVar[str] = """
+    @article{pisauro2017neural,
+        title={Neural correlates of evidence accumulation during value-based decisions revealed via simultaneous {EEG-fMRI}},
+        author={Pisauro, M Andrea and Fouragnan, Elsa and Retzler, Chris and Philiastides, Marios G},
+        journal={Nature Communications},
+        volume={8},
+        number={1},
+        pages={15808},
+        year={2017},
+        doi={10.1038/ncomms15808}
+    }
+    """
+    url: tp.ClassVar[str] = "https://openneuro.org/datasets/ds002734"
+    licence: tp.ClassVar[str] = "CC0-1.0"
+    description: tp.ClassVar[str] = (
+        "Simultaneous EEG-fMRI from 22 participants during value-based food choices."
+    )
+    OPENNEURO_ID: tp.ClassVar[str] = "ds002734"
+    DOWNLOAD_EXCLUDE: tp.ClassVar[tuple[str, ...]] = ("sub-*/anat",)
+    RAW_EEG_PREPROC: tp.ClassVar[str] = "authors"
+    RAW_EEG_DATA: tp.ClassVar[dict[str, str]] = {".mat": ".eeg"}  # raw EEG is not shared
+    EVENTS_RELATIVE_TO_FMRI: tp.ClassVar[bool] = False  # events built on the EEG clock
+    FMRI_DELAY: tp.ClassVar[float] = 25.0  # first shared volume, after t0 (s)
+
+    def _eeg_file(self, timeline: dict[str, tp.Any]) -> Path | None:
+        sub, run = timeline["subject"], timeline["run"]
+        fp = self._folder(timeline, "EEG") / f"EEG_data_sub{sub}_run_{run}.mat"
+        return fp if fp.exists() else None
+
+    def _eeg_events(self, timeline: dict[str, tp.Any]) -> tp.Any:
+        import scipy.io
+
+        fp = self._folder(timeline, "EEG") / f"EEG_events_sub{timeline['subject']}.mat"
+        events = scipy.io.loadmat(fp, squeeze_me=True, struct_as_record=False)["events"]
+        return events[int(timeline["run"]) - 1]
+
+    def _volume_onsets(self, timeline: dict[str, tp.Any]) -> np.ndarray:
+        # no volume markers: first volume from t0, then one per TR
+        n_volumes = nibabel.load(self._bold_file(timeline)).shape[-1]
+        tr = float(json.loads(self._inherited_file(timeline, "func", "bold.json").read_text())["RepetitionTime"])  # type: ignore
+        return self._eeg_events(timeline).t0 / 1000 + self.FMRI_DELAY + tr * np.arange(n_volumes)
+
+    def _preproc_eeg_events(self, timeline: dict[str, tp.Any]) -> list[dict[str, tp.Any]]:
+        import scipy.io
+
+        fp = self._eeg_file(timeline)
+        n_samples = dict((n, s) for n, s, _ in scipy.io.whosmat(fp))["Y"][1]
+        freq = float(scipy.io.loadmat(fp, variable_names=["fd"], squeeze_me=True)["fd"])
+        loader = study.SpecialLoader(method=self._load_eeg, timeline=timeline)
+        return [
+            dict(
+                type="Eeg",
+                start=0.0,
+                duration=n_samples / freq,
+                frequency=freq,
+                filepath=loader.to_json(),
+                preproc="authors",
+            )
+        ]
+
+    def _load_eeg(self, timeline: dict[str, tp.Any]) -> mne.io.RawArray:
+        import scipy.io
+
+        mat = scipy.io.loadmat(self._eeg_file(timeline), variable_names=["Y", "fd"], squeeze_me=True)
+        names = [f"EEG{k + 1:02d}" for k in range(mat["Y"].shape[0])]  # channel names not shared
+        info = mne.create_info(names, float(mat["fd"]), ch_types="eeg")
+        return mne.io.RawArray(mat["Y"] * 1e-6, info, verbose=False)  # µV -> V
+
+    def _task_events(self, timeline: dict[str, tp.Any]) -> pd.DataFrame:
+        ev = self._eeg_events(timeline)
+        trials = dict(
+            rt=ev.rt / 1000,
+            choose_left=ev.chooseL.astype(bool),
+            correct=ev.corr.astype(bool),
+            rating_left=ev.ratL,
+            rating_right=ev.ratR,
+            difficulty=ev.diffV,
+        )
+        stim = pd.DataFrame(dict(start=ev.tstim / 1000, duration=1.25, description="stim", **trials))
+        resp = pd.DataFrame(dict(start=ev.respt / 1000, duration=0.0, description="resp", **trials))
+        events = pd.concat([stim, resp], ignore_index=True).sort_values("start")
+        events["type"] = "Stimulus"
+        return events.reset_index(drop=True)
+
+
+@lru_cache
+def _gradient_onset(fp: str) -> tuple[float, float]:
+    """Start and stop (s) of the MR gradient artifact in a raw in-scanner EEG
+    (longest block where the >100 Hz power is above half its 90th percentile)."""
+    import scipy.signal
+
+    with nutils.ignore_all():
+        raw = mne.io.read_raw_eeglab(fp, preload=True, verbose=False)
+    data = raw.pick("eeg").get_data()
+    sos = scipy.signal.butter(4, 100, "highpass", fs=raw.info["sfreq"], output="sos")
+    power = (scipy.signal.sosfiltfilt(sos, data, axis=1) ** 2).mean(0)
+    step = int(raw.info["sfreq"] / 100)  # 10 ms bins
+    env = np.sqrt(power[: len(power) // step * step].reshape(-1, step).mean(1))
+    above = np.flatnonzero(env > 0.5 * np.percentile(env, 90))
+    blocks = np.split(above, np.flatnonzero(np.diff(above) > 100) + 1)  # gaps > 1 s
+    block = max(blocks, key=len)
+    return block[0] / 100, (block[-1] + 1) / 100
+
+
+class GallegoRudolf2022Preservation(_BidsEegFmri):
+    """EEG-fMRI artifact dataset: EEG outside the scanner, inside without and with fMRI.
+
+    Experimental Design:
+        - 32-channel EEG + ECG (1000 Hz) and 3T GE fMRI (TR = 2 s), 20 participants
+        - Paradigm: eyes-closed resting state (10 min) and an eyes open / eyes
+          closed block task (20 s blocks), simultaneously with fMRI; the same EEG
+          was also recorded outside the scanner and inside without scanning
+
+    Data Format:
+        - Mendeley Data (doi:10.17632/crhybxpdy6.2): two BIDS trees,
+          ``BIDS_dataset_EEG`` (EEGLAB) and ``BIDS_dataset_MRI``
+        - Timelines: session 1 BOLD (recorded with the EEG cap) ``eoec`` <->
+          EEG ``fmrieoec`` and ``rest`` <-> EEG ``fmrirestingec``. Not loaded (no
+          paired recording): EEG ``outside``, ``inside``, ``fmrirestingeo`` (130 s)
+          and session 2 BOLD (without cap)
+        - EEG: authors' gradient-corrected EEG
+          (``derivatives/Gradient_artifact_corrected/*_gac_eeg.set``, BCG still
+          present, same length as raw) and raw EEG. Channel names are not shared
+          (``E1``-``E32``, ``ECG``)
+        - No markers in the EEG: the volumes are found from the gradient artifact
+          in the raw EEG. It lasts 5 TRs (sub-001, sub-002) or 10 TRs (others)
+          longer than the saved BOLD: 5 unsaved volumes at the end and, in most
+          runs, 5 at the start. First volume = artifact end - (n_volumes + 5) TR,
+          snapped to the artifact onset grid (checked on the eoec runs with the
+          alpha EC/EO contrast of the EEG, and on sub-001 with the BOLD response)
+        - Runs without raw EEG data on Mendeley are not loaded (sub-003 eoec;
+          rest of sub-002, 003, 004, 005, 008); sub-019 has no rest BOLD
+        - Events: Eeg, Fmri, Stimulus (``EO``/``EC`` blocks of ``eoec``)
+    """
+
+    bibtex: tp.ClassVar[str] = """
+    @article{gallegorudolf2022preservation,
+        title={Preservation of {EEG} spectral power features during simultaneous {EEG-fMRI}},
+        author={Gallego-Rudolf, Jonathan and Corsi-Cabrera, Mar{\\'i}a and Concha, Luis and Ricardo-Garcell, Josefina and Pasaye-Alcaraz, Erick},
+        journal={Frontiers in Neuroscience},
+        volume={16},
+        pages={951321},
+        year={2022},
+        doi={10.3389/fnins.2022.951321}
+    }
+    """
+    url: tp.ClassVar[str] = "https://data.mendeley.com/datasets/crhybxpdy6/2"
+    licence: tp.ClassVar[str] = "CC-BY-4.0"
+    description: tp.ClassVar[str] = (
+        "Simultaneous EEG-fMRI from 20 participants during eyes-closed rest and an "
+        "eyes open / eyes closed task, with EEG also recorded outside the scanner."
+    )
+    MENDELEY_ID: tp.ClassVar[str] = "crhybxpdy6"
+    MENDELEY_VERSION: tp.ClassVar[int] = 2
+    EEG_TASKS: tp.ClassVar[dict[str, str]] = {"eoec": "fmrieoec", "rest": "fmrirestingec"}
+    EEG_EXTENSIONS: tp.ClassVar[tuple[str, ...]] = (".set",)
+    RAW_EEG_DATA: tp.ClassVar[dict[str, str]] = {".set": ".fdt"}
+    EXTRA_TRS: tp.ClassVar[int] = 5
+
+    def _download(self, overwrite: bool = False) -> None:
+        import urllib.request
+
+        api = f"https://data.mendeley.com/public-api/datasets/{self.MENDELEY_ID}"
+        headers = {"User-Agent": "curl/8.5.0"}  # default Python user agent is refused
+
+        def get(url: str) -> tp.Any:
+            return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=headers)))
+
+        folders = {f["id"]: f for f in get(f"{api}/folders/{self.MENDELEY_VERSION}")}
+
+        def folder_path(fid: str) -> str:
+            parts = []
+            while fid in folders:
+                parts.append(folders[fid]["name"])
+                fid = folders[fid].get("parent_id", "")
+            return "/".join(reversed(parts[:-1]))  # drop the top "Simultaneous EEG-fMRI" folder
+
+        eeg_tasks = "|".join(self.EEG_TASKS.values())
+        for fid in folders:
+            for f in get(f"{api}/files?folder_id={fid}&version={self.MENDELEY_VERSION}"):
+                rel = f"{folder_path(fid)}/{f['filename']}"
+                if "/anat/" in rel or "/ses-002/" in rel:  # no paired EEG (ses-002: no cap)
+                    continue
+                if "_eeg." in rel and not re.search(rf"task-({eeg_tasks})_", rel):
+                    continue  # EEG outside/inside the scanner, without fMRI
+                out = self._bids_root() / rel
+                if out.exists() and out.stat().st_size == f["size"] and not overwrite:
+                    continue
+                out.parent.mkdir(parents=True, exist_ok=True)
+                url = f["content_details"]["download_url"]
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers)) as r:
+                    out.write_bytes(r.read())
+
+    def _mri_root(self) -> Path:
+        return self._bids_root() / "BIDS_dataset_MRI"
+
+    def _folder(self, timeline: dict[str, tp.Any], datatype: str) -> Path:
+        folder = self._mri_root() / f"sub-{timeline['subject']}" / f"ses-{timeline['session']}"
+        return folder / datatype
+
+    def _inherited_file(
+        self, timeline: dict[str, tp.Any], datatype: str, suffix: str
+    ) -> Path | None:
+        candidates = [
+            self._folder(timeline, datatype) / f"{self._prefix(timeline)}_{suffix}",
+            self._mri_root() / f"task-{timeline['task']}_{suffix}",
+        ]
+        return next((fp for fp in candidates if fp.exists()), None)
+
+    def iter_timelines(self) -> tp.Iterator[dict[str, tp.Any]]:
+        for bold in sorted(self._mri_root().glob("sub-*/ses-*/func/*_bold.nii*")):
+            entities = dict(re.findall(r"(sub|ses|task|run)-([a-zA-Z0-9]+)", bold.name))
+            timeline = {_ENTITIES[k]: v for k, v in entities.items()}
+            if self._eeg_file(timeline) is not None:  # session 1 only
+                yield timeline
+
+    def _eeg_file(self, timeline: dict[str, tp.Any]) -> Path | None:
+        task = self.EEG_TASKS.get(timeline["task"])
+        if timeline.get("session") != "001" or task is None:
+            return None
+        sub = f"sub-{timeline['subject']}"
+        fp = self._bids_root() / "BIDS_dataset_EEG" / sub / "eeg" / f"{sub}_task-{task}_eeg.set"
+        # the raw data is needed to find the fMRI onset (missing for 6 runs on Mendeley)
+        return fp if fp.with_suffix(".fdt").exists() else None
+
+    def _preproc_eeg_file(self, timeline: dict[str, tp.Any]) -> Path | None:
+        raw_fp = self._eeg_file(timeline)
+        assert raw_fp is not None
+        folder = self._bids_root() / "BIDS_dataset_EEG" / "derivatives" / "Gradient_artifact_corrected"
+        fp = folder / raw_fp.name.replace("_eeg.set", "_gac_eeg.set")
+        return fp if fp.exists() else None
+
+    def _preproc_eeg_events(self, timeline: dict[str, tp.Any]) -> list[dict[str, tp.Any]]:
+        pre_fp = self._preproc_eeg_file(timeline)
+        if pre_fp is None:
+            return []
+        # same length as the raw EEG (no markers to match)
+        return [dict(type="Eeg", start=0.0, filepath=str(pre_fp), preproc="authors")]
+
+    def _volume_onsets(self, timeline: dict[str, tp.Any]) -> np.ndarray:
+        raw_fp = self._eeg_file(timeline)
+        assert raw_fp is not None
+        bold_json = self._inherited_file(timeline, "func", "bold.json")
+        assert bold_json is not None
+        tr = float(json.loads(bold_json.read_text())["RepetitionTime"])
+        n_volumes = nibabel.load(self._bold_file(timeline)).shape[-1]
+        start, stop = _gradient_onset(str(raw_fp))
+        if stop - start < n_volumes * tr - 0.5:
+            raise RuntimeError(f"Gradient artifact of {raw_fp.name} shorter than the BOLD")
+        # the scanner runs EXTRA_TRS volumes after the last saved one (and, in most
+        # runs, 5 unsaved volumes before the first one)
+        first = stop - (n_volumes + self.EXTRA_TRS) * tr
+        if start > 0:  # artifact onset recorded: snap to its volume grid
+            first = start + max(round((first - start) / tr), 0) * tr
+        return first + tr * np.arange(n_volumes)
+
+
+class VanDerMeer2016Eyes(_BidsEegFmri):
+    """CWL EEG-fMRI: eyes open / eyes closed with carbon wire loop motion channels.
+
+    Experimental Design:
+        - 8 participants, 4 on a 3T Siemens Trio (TR = 1.95 s) and 4 on a 3T
+          Siemens Verio (TR = 2 s); 30 EEG channels + EOG + ECG + 6 carbon wire
+          loops (CW1-CW6), 5000 Hz
+        - Paradigm: ~30 s blocks of eyes open / eyes closed, with flashes at the
+          end of each block, recorded with the helium pump on and off
+          (``acq-pumpon`` / ``acq-pumpoff``)
+
+    Data Format:
+        - NITRC ``cwleegfmri_data``: one tarball per participant (not BIDS),
+          reorganised into a BIDS-like tree at download (``sub-01``-``sub-04`` =
+          ``trio1``-``trio4``, ``sub-05``-``sub-08`` = ``verio5``-``verio8``,
+          see ``participants.tsv``)
+        - EEG: raw in-scanner EEG (5000 Hz) and the authors' MR-corrected EEG
+          (``derivatives/mrcorrected``, gradient + pulse artifact removed,
+          1000 Hz, same length as the raw). EEG inside the scanner without fMRI
+          (``task-noscan``) and outside (``task-outside``) is kept but not loaded
+        - Not loaded: MNI-normalised BOLD (``derivatives/normalized``), SPM models
+          (``derivatives/spm_model``), T1, motion parameters
+        - No scanner triggers in the EEG, but ``mri`` markers (added by the
+          authors) on the volume grid: the first one is 2 TR (dummy scans) after
+          the gradient artifact onset in all 16 runs, and the artifact repeats
+          exactly every 1.950 s (Trio; the NIfTI header says 1.9575) / 2 s (Verio).
+          First volume = first ``mri`` marker. The EEG often stops before the end
+          of the scan (gradient artifact up to the last EEG sample): 0-10 final
+          volumes have no marker and no EEG
+        - Events: Eeg, Fmri, Stimulus (``eyes_open`` / ``eyes_closed`` blocks from
+          the ``beo``/``eeo`` and ``bec``/``eec`` markers, ``flash``)
+    """
+
+    bibtex: tp.ClassVar[str] = """
+    @article{vandermeer2016eyes,
+        title={Eyes open -- eyes closed {EEG/fMRI} data set including dedicated ``Carbon Wire Loop'' motion detection channels},
+        author={van der Meer, Johan N. and Pampel, Andr{\\'e} and van Someren, Eus J. W. and Ramautar, Jennifer R. and van der Werf, Ysbrand D. and Gomez-Herrero, German and Lepsien, J{\\"o}ran and Hellrung, Lydia and Hinrichs, Hermann and M{\\"o}ller, Harald E. and Walter, Martin},
+        journal={Data in Brief},
+        volume={7},
+        pages={990--994},
+        year={2016},
+        doi={10.1016/j.dib.2016.03.001}
+    }
+    """
+    url: tp.ClassVar[str] = "https://www.nitrc.org/projects/cwleegfmri_data/"
+    licence: tp.ClassVar[str] = "MIT"
+    description: tp.ClassVar[str] = (
+        "Simultaneous EEG-fMRI from 8 participants during eyes open / eyes closed "
+        "blocks, with carbon wire loop motion channels and the helium pump on or off."
+    )
+    requirements: tp.ClassVar[tuple[str, ...]] = ()
+    ARCHIVE_URL: tp.ClassVar[str] = "https://cwleegfmri_data.projects.nitrc.org/downloads/{}.tar.gz"
+    # original subject name -> (BIDS subject, TR in s)
+    SUBJECTS: tp.ClassVar[dict[str, tuple[str, float]]] = {
+        **{f"trio{i}": (f"0{i}", 1.95) for i in range(1, 5)},
+        **{f"verio{i}": (f"0{i}", 2.0) for i in range(5, 9)},
+    }
+    EEG_EXTENSIONS: tp.ClassVar[tuple[str, ...]] = (".set",)
+    RAW_EEG_DATA: tp.ClassVar[dict[str, str]] = {}  # data inside the .set
+    PREPROC_EEG: tp.ClassVar[str | None] = (
+        "derivatives/mrcorrected/{sub_dir}/eeg/{prefix}_desc-mrcorrected_eeg.set"
+    )
+    VOLUME_MARKER: tp.ClassVar[str] = "mri"
+    EVENTS_RELATIVE_TO_FMRI: tp.ClassVar[bool] = False
+
+    @staticmethod
+    def _bids_name(rel: str, sub: str) -> str | None:
+        """BIDS path (relative to download/) of a CWL_Data file, None if not kept."""
+        name = Path(rel).name
+        acq = "pumpon" if "hpump-on" in name else "pumpoff"
+        func = f"sub-{sub}_task-eoec_acq-{acq}"
+        if rel.startswith("mri/t1/"):
+            return f"sub-{sub}/anat/sub-{sub}_T1w.nii"
+        if rel.startswith("mri/epi_raw/"):
+            return f"sub-{sub}/func/{func}_bold.nii"
+        if rel.startswith("mri/epi_motionparams/"):
+            return f"sub-{sub}/func/{func}_motion.txt"
+        if rel.startswith("mri/epi_normalized/") and name.endswith(".nii"):
+            return f"derivatives/normalized/sub-{sub}/func/{func}_space-MNI_bold.nii"
+        if rel.startswith("spm_model_in-scan/"):
+            acq = "pumpon" if name.endswith("_on.mat") else "pumpoff"
+            return f"derivatives/spm_model/sub-{sub}/sub-{sub}_task-eoec_acq-{acq}_model.mat"
+        if rel.startswith("eeg/in-scan/") and "mrcorrected" in name:
+            return f"derivatives/mrcorrected/sub-{sub}/eeg/{func}_desc-mrcorrected_eeg.set"
+        if rel.startswith("eeg/in-scan/"):
+            return f"sub-{sub}/eeg/{func}_eeg.set"
+        if rel.startswith("eeg/in-noscan/"):
+            return f"sub-{sub}/eeg/sub-{sub}_task-noscan_acq-{acq}_eeg.set"
+        if rel.startswith("eeg/out/"):
+            when = "before" if "before" in name else "after"
+            return f"sub-{sub}/eeg/sub-{sub}_task-outside_acq-{when}_eeg.set"
+        return None  # e.g. .mat of the normalisation
+
+    def _download(self, overwrite: bool = False) -> None:
+        import shutil
+        import subprocess
+        import tarfile
+
+        root = self._bids_root()
+        archives = self.path / "archives"
+        archives.mkdir(parents=True, exist_ok=True)
+        rows = []
+        for name, (sub, tr) in self.SUBJECTS.items():
+            rows.append(dict(participant_id=f"sub-{sub}", original=name,
+                             scanner=name.rstrip("0123456789").capitalize(), tr=tr))
+            if (root / f"sub-{sub}" / "func").exists() and not overwrite:
+                continue
+            tgz = archives / f"{name}.tar.gz"
+            # curl: the host's certificate does not match its name, Python refuses it
+            subprocess.run(["curl", "-sSfL", "-C", "-", "-o", str(tgz),
+                            self.ARCHIVE_URL.format(name)], check=True)
+            tmp = archives / name
+            with tarfile.open(tgz) as tf:
+                tf.extractall(tmp, filter="data")
+            for fp in sorted((tmp / "CWL_Data").rglob("*")):
+                rel = fp.relative_to(tmp / "CWL_Data").as_posix()
+                out = self._bids_name(rel, sub) if fp.is_file() else None
+                if out is None:
+                    continue
+                out_fp = root / out
+                out_fp.parent.mkdir(parents=True, exist_ok=True)
+                if out_fp.suffix == ".txt":  # SPM realignment parameters -> tsv
+                    cols = ["trans_x", "trans_y", "trans_z", "rot_x", "rot_y", "rot_z"]
+                    motion = pd.read_csv(fp, sep=r"\s+", header=None, names=cols)
+                    motion.to_csv(out_fp.with_suffix(".tsv"), sep="\t", index=False)
+                    continue
+                shutil.move(fp, out_fp)
+                if out_fp.name.endswith("_bold.nii") and "derivatives" not in out:
+                    sidecar = dict(RepetitionTime=tr, TaskName="eoec")
+                    out_fp.with_suffix(".json").write_text(json.dumps(sidecar, indent=2))
+            shutil.rmtree(tmp)
+            tgz.unlink()
+        pd.DataFrame(rows).to_csv(root / "participants.tsv", sep="\t", index=False)
+        archives.rmdir()
+
+    def iter_timelines(self) -> tp.Iterator[dict[str, tp.Any]]:
+        for bold in sorted(self._bids_root().glob("sub-*/func/*_task-eoec_*_bold.nii")):
+            entities = dict(re.findall(r"(sub|task|acq)-([a-zA-Z0-9]+)", bold.name))
+            timeline = {_ENTITIES[k]: v for k, v in entities.items()}
+            if self._eeg_file(timeline) is not None:
+                yield timeline
+
+    def _preproc_eeg_events(self, timeline: dict[str, tp.Any]) -> list[dict[str, tp.Any]]:
+        pre_fp = self._preproc_eeg_file(timeline)
+        if pre_fp is None:
+            return []
+        with nutils.ignore_all():
+            pre_markers = mne.read_annotations(pre_fp)
+        # EEGLAB "boundary" (segment joins, not events) would be the rarest shared marker
+        markers = [a[np.asarray(a.description) != "boundary"]
+                   for a in (self._raw_markers(timeline), pre_markers)]
+        offset = self._preproc_offset(*markers, pre_fp)
+        return [dict(type="Eeg", start=offset, filepath=str(pre_fp), preproc="authors")]
+
+    def _task_events(self, timeline: dict[str, tp.Any]) -> pd.DataFrame:
+        annots = self._raw_markers(timeline)
+        desc, onset = np.asarray(annots.description), annots.onset
+        rows = []
+        for begin, end, name in [("beo", "eeo", "eyes_open"), ("bec", "eec", "eyes_closed")]:
+            ends = onset[desc == end]
+            for start in onset[desc == begin]:
+                after = ends[ends > start]
+                if len(after):
+                    rows.append(dict(start=start, duration=after[0] - start, description=name))
+        rows += [dict(start=t, duration=0.0, description="flash") for t in onset[desc == "fl"]]
+        events = pd.DataFrame(rows).sort_values("start", ignore_index=True)
+        events["type"] = "Stimulus"
+        return events
